@@ -1,138 +1,273 @@
 import os
 import discord
 from discord.ext import commands
-import boto3
 from dotenv import load_dotenv
 import asyncio
 import random
 from keep_alive import keep_alive
-
+import azure_vm
+import ssh_manager
 
 
 # Cargar variables de entorno
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-REGION = 'us-east-1'
-INSTANCE_ID = os.getenv('INSTANCE_ID')
-
-# Configurar conexión con AWS
-ec2 = boto3.client('ec2', 
-                   region_name=REGION,
-                   aws_access_key_id=os.getenv('AWS_ACCESS_KEY'),
-                   aws_secret_access_key=os.getenv('AWS_SECRET_KEY'))
 
 # Configurar el Bot de Discord con los permisos (Intents)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Vista interactiva con botones para elegir modpack
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ModpackView(discord.ui.View):
+    """
+    Vista con dos botones: ATM 10 (verde) y Cursed Walking (rojo).
+    Al hacer clic, ejecuta la secuencia SSH: stop → esperar → start.
+    """
+
+    def __init__(self, vm_ip: str, channel):
+        super().__init__(timeout=120)  # 2 minutos para elegir
+        self.vm_ip = vm_ip
+        self.channel = channel  # Canal donde enviar mensajes nuevos
+
+    async def _launch_modpack(self, interaction: discord.Interaction, modpack_name: str):
+        """Lógica compartida por ambos botones: detener, esperar, iniciar."""
+
+        # 1. Deshabilitar botones para evitar doble clic
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(
+            content=f"✅ **{interaction.user.display_name}** eligió **{modpack_name}**.",
+            view=self
+        )
+
+        try:
+            # 2. Paso A — Apagar seguro: enviar 'stop' a la consola de Minecraft
+            await self.channel.send(f"🍆 Deteniendo servidor anterior (si hay alguno)...")
+            await asyncio.to_thread(ssh_manager.stop_minecraft_server, self.vm_ip)
+
+            # 3. Paso B — Esperar 10s para que Java guarde chunks y mundo
+            await self.channel.send("⏳ Esperando 10s para que Java guarde los chunks...")
+            await asyncio.sleep(10)
+
+            # 4. Paso C — Iniciar el modpack elegido en una nueva sesión de screen
+            await self.channel.send(f"🚀🍑🍆 Lanzando **{modpack_name}**...")
+            await asyncio.to_thread(ssh_manager.start_modpack, self.vm_ip, modpack_name)
+
+            # 5. Confirmación final con embed visual + imagen
+            # URL de imagen para cuando el modpack se lanza (cambia esta URL por la que quieras)
+            url_img_modpack = "https://raw.githubusercontent.com/puntodev90-dev/images/refs/heads/main/WhatsApp%20Image%202026-05-14%20at%209.17.17%20AM.jpeg"
+
+            embed = discord.Embed(
+                title=f"🚀 Iniciando  {modpack_name}",
+                description=(
+                    f"Dame un par de minutos para cargar PENTAHO.....\n\n"
+                    f"**IP:** `{self.vm_ip}:25565`"
+                ),
+                color=discord.Color.green()
+            )
+            embed.set_image(url=url_img_modpack)
+            embed.set_footer(text=f"Solicitado por {interaction.user.display_name}")
+
+            await self.channel.send(embed=embed)
+
+        except Exception as e:
+            await self.channel.send(f"❌ Error al iniciar **{modpack_name}**: `{e}`")
+
+    @discord.ui.button(label="ATM 10", style=discord.ButtonStyle.green, emoji="🍑")
+    async def atm10_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._launch_modpack(interaction, "ATM 10")
+
+    @discord.ui.button(label="Cursed Walking", style=discord.ButtonStyle.red, emoji="🍆")
+    async def cursed_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._launch_modpack(interaction, "Cursed Walking")
+
+    async def on_timeout(self):
+        """Si nadie elige en 2 minutos, deshabilitar los botones."""
+        for child in self.children:
+            child.disabled = True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Eventos del bot
+# ══════════════════════════════════════════════════════════════════════════════
+
 @bot.event
 async def on_ready():
     print(f'Bot conectado exitosamente como {bot.user}')
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Comando: !prender — Enciende la VM de Azure + elige modpack
+# ══════════════════════════════════════════════════════════════════════════════
+
 @bot.command(name='prender')
 async def prender_server(ctx):
-    # Aviso inicial de que el proceso es largo
-    await ctx.send("⏳ Contactando a Pablo... Iniciando el Rape Mode.\n⚠️ 5 minutos tarda en encender el server ")
-    
-    try:
-        # 1. Mandar a encender la instancia
-        ec2.start_instances(InstanceIds=[INSTANCE_ID])
-        await ctx.send("✅ Instancia iniciada. Obteniendo IP")
-        
-        # 2. Esperar 5 segundos para la IP
-        await asyncio.sleep(5)
-        
-        response = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
-        ip_publica = response['Reservations'][0]['Instances'][0].get('PublicIpAddress')
-        
-        if ip_publica:
-            await ctx.send(f"🌐 IP obtenida: `{ip_publica}` recordadr que hay que cambiar la ip cada vez que se inicie el servidor\n⏳ Me quedaré esperando el resto del tiempo de carga. Te avisaré apenas pasen los 6:30 min.")
-        else:
-            await ctx.send("⚠️ AWS aún no suelta la IP, pero el servidor sigue cargando. Avisaré al terminar los 6:30 min.")
+    """Enciende la VM en Azure, obtiene la IP, y presenta los botones de modpack."""
 
-        # 3. Esperar el resto del tiempo para completar los 6:30 min (390 segundos)
-        # Como ya esperamos 15, restamos: 390 - 15 = 375 segundos
-        await asyncio.sleep(285)
+    await ctx.send("⏳ Despertando la máquina en Azure🍑🍆🍑🍆🍑🍆🍑🍆...")
+
+    try:
+        # 1. Enviar comando de encendido (fire-and-forget, no espera)
+        await asyncio.to_thread(azure_vm.start_vm)
+        await ctx.send("✅🍑🍆 Comando de encendido enviado a Azure y despertando a dieguito.")
+
+        # 2. Pollear el estado cada 10s hasta que esté 'running'
+        vm_encendida = False
+        for _ in range(24):  # Máximo ~4 minutos
+            await asyncio.sleep(10)
+            estado = await asyncio.to_thread(azure_vm.get_vm_status)
+            if estado == 'running':
+                vm_encendida = True
+                break
         
-        # 4. Aviso final de servidor listo con imagen desde GitHub
-        mencion = "@everyone" # Puedes cambiar esto por un rol si prefieres
-        
-        # Usamos el enlace RAW de GitHub para que Discord pueda renderizar la imagen
-        url_imagen_github = "https://raw.githubusercontent.com/ttvgestapo-dev/imagenes-bot/main/WhatsApp%20Image%202026-05-14%20at%209.17.17%20AM.jpeg"
-        
-        # Creamos el diseño visual (Embed)
-        embed = discord.Embed(
-            title="🔥 ¡EL SERVIDOR ESTA LISTO!",
-            description=f"{mencion} **¡TODOS A VIOLAR!**",
-            color=discord.Color.dark_red() # Color de la barrita lateral
-        )
-        embed.set_image(url=url_imagen_github)
-        
-        # Enviamos el aviso final con la imagen incorporada
-        await ctx.send(embed=embed)
-            
+        if not vm_encendida:
+            await ctx.send("⚠️ La VM está tardando más de lo esperado. Usa `!estado` para verificar.")
+            return
+
+        await ctx.send("✅ ¡La máquina está encendida!")
+
+        # 3. Obtener IP pública con reintentos (puede tardar unos segundos en asignarse)
+        vm_ip = None
+        last_error = None
+        for intento in range(8):  # 8 intentos x 5s = 40s máximo
+            try:
+                vm_ip = await asyncio.to_thread(azure_vm.get_vm_ip)
+            except Exception as ip_err:
+                last_error = ip_err
+            if vm_ip:
+                break
+            await asyncio.sleep(5)
+
+        if not vm_ip:
+            error_detail = f"\nError: `{last_error}`" if last_error else ""
+            await ctx.send(f"⚠️ No se pudo obtener la IP pública.{error_detail}")
+            return
+
+        await ctx.send(f"🌐 IP obtenida: `{vm_ip}:25565`")
+
+        # 4. Esperar a que SSH esté listo
+        await asyncio.sleep(10)
+
+        # 5. Mostrar botones de selección de modpack
+        view = ModpackView(vm_ip, ctx.channel)
+        await ctx.send("🎮 **¿Qué modpack deseas jugar, bestia?**", view=view)
+
     except Exception as e:
-        await ctx.send(f"❌ Error al iniciar: {e}")
+        await ctx.send(f"❌ Error al encender la VM: `{e}`")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Comando: !apagar — Detiene Minecraft + desasigna la VM (frena cobros)
+# ══════════════════════════════════════════════════════════════════════════════
 
 @bot.command(name='apagar')
 async def apagar_server(ctx):
-    await ctx.send("⏳ Apagando el servidor, Pablo no contesto...")
+    """Envía 'stop' por SSH, espera, y luego desasigna la VM para frenar los cobros."""
+
+    await ctx.send("⏳ Apagando el servidor de Minecraft...")
+
     try:
-        # 1. Mandar a apagar la instancia
-        ec2.stop_instances(InstanceIds=[INSTANCE_ID])
-        
-        # 2. Enlaces RAW de GitHub (vital para que Discord renderice la foto)
-        url_img1 = "https://raw.githubusercontent.com/ttvgestapo-dev/imagenes-bot/main/WhatsApp%20Image%202026-05-14%20at%209.39.59%20AM.jpeg"
-        url_img2 = "https://raw.githubusercontent.com/ttvgestapo-dev/imagenes-bot/main/WhatsApp%20Image%202026-05-14%20at%209.38.35%20AM.jpeg"
-        
-        # 3. Creamos el primer diseño (Embed) con el texto y la primera imagen
+        # 1. Obtener la IP para conectarse por SSH
+        vm_ip = await asyncio.to_thread(azure_vm.get_vm_ip)
+
+        if vm_ip:
+            # 2. Enviar 'stop' a la consola de Minecraft
+            await asyncio.to_thread(ssh_manager.stop_minecraft_server, vm_ip)
+            await ctx.send("🛑 Comando `stop` enviado a Minecraft. Esperando 15s para guardar chunks...")
+
+            # 3. Darle tiempo a Java para guardar el mundo
+            await asyncio.sleep(15)
+
+        # 4. Enviar comando de desasignación (fire-and-forget)
+        await ctx.send("💤 Desasignando la VM en Azure...")
+        await asyncio.to_thread(azure_vm.deallocate_vm)
+
+        # 5. Pollear hasta que esté desasignada
+        vm_apagada = False
+        for _ in range(18):  # Máximo ~3 minutos
+            await asyncio.sleep(10)
+            estado = await asyncio.to_thread(azure_vm.get_vm_status)
+            if estado == 'deallocated':
+                vm_apagada = True
+                break
+
+        if not vm_apagada:
+            await ctx.send("⚠️ La desasignación está tardando. Usa `!estado` para verificar.")
+            return
+
+        # 6. Confirmación visual con embeds e imágenes
         embed1 = discord.Embed(
-            title="💤 Servidor apagado.",
-            description="**¡Alguien sera violado!**",
-            color=discord.Color.dark_gray() # Color gris para indicar que está apagado
-        )
-        embed1.set_image(url=url_img1)
-        
-        # 4. Creamos el segundo diseño (Embed) que solo contendrá la segunda imagen
-        embed2 = discord.Embed(
+            title="💤 Servidor apagado y desasignado.",
+            description="**La VM ha sido desasignada. No se generan cobros.**",
             color=discord.Color.dark_gray()
         )
+
+        url_img1 = "https://raw.githubusercontent.com/puntodev90-dev/images/refs/heads/main/WhatsApp%20Image%202026-05-14%20at%209.38.35%20AM.jpeg"
+        url_img2 = "https://raw.githubusercontent.com/puntodev90-dev/images/refs/heads/main/WhatsApp%20Image%202026-06-08%20at%201.18.28%20AM%20(2).jpeg"
+
+        embed1.set_image(url=url_img1)
+
+        embed2 = discord.Embed(color=discord.Color.dark_gray())
         embed2.set_image(url=url_img2)
-        
-        # 5. Enviamos ambos embeds de una sola vez usando el parámetro 'embeds' (en plural)
+
         await ctx.send(embeds=[embed1, embed2])
-        
+
     except Exception as e:
-        await ctx.send(f"❌ Error al apagar: {e}")
+        await ctx.send(f"❌ Error al apagar: `{e}`")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Comando: !estado — Consulta el estado de la VM en Azure
+# ══════════════════════════════════════════════════════════════════════════════
 
 @bot.command(name='estado')
 async def estado_server(ctx):
+    """Consulta el estado actual de la VM en Azure."""
     try:
-        response = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
-        estado = response['Reservations'][0]['Instances'][0]['State']['Name']
-        
-        # Le damos un poco de formato visual dependiendo del estado
+        estado = await asyncio.to_thread(azure_vm.get_vm_status)
+
         if estado == 'running':
-            mensaje = "🟢 El servidor está **CUCKEANDO** mientras Dieguito está en la Muni sentado haciendo **NADA!!**!"
+            try:
+                vm_ip = await asyncio.to_thread(azure_vm.get_vm_ip)
+            except Exception as ip_err:
+                vm_ip = None
+                print(f"[!estado] Error obteniendo IP: {ip_err}")
+            ip_text = f"\n🌐 IP: `{vm_ip}:25565`" if vm_ip else "\n⚠️ No se pudo obtener la IP."
+            mensaje = f"🟢 La VM está **ENCENDIDA** y corriendo.{ip_text}"
+        elif estado == 'deallocated':
+            mensaje = "🔴 La VM está **DESASIGNADA** (apagada, sin cobros)."
+        elif estado == 'starting':
+            mensaje = "🟡 La VM se está **encendiendo** en este momento."
+        elif estado in ('stopping', 'deallocating'):
+            mensaje = "🟡 La VM se está **apagando/desasignando**."
         elif estado == 'stopped':
-            mensaje = "🔴 El servidor está **APAGADO** y dieguito fue violado!!."
-        elif estado == 'pending':
-            mensaje = "🟡 El servidor se está encendiendo en este momento."
-        elif estado == 'stopping':
-            mensaje = "🟡 El servidor se está apagando."
+            mensaje = (
+                "🟠 La VM está **detenida** pero aún asignada (puede generar cobros).\n"
+                "Usa `!apagar` para desasignar completamente."
+            )
         else:
-            mensaje = f"⚪ Estado actual: {estado}"
-            
+            mensaje = f"⚪ Estado actual de la VM: `{estado}`"
+
         await ctx.send(mensaje)
     except Exception as e:
-        await ctx.send(f"❌ Error al consultar estado: {e}")
+        await ctx.send(f"❌ Error al consultar estado: `{e}`")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Comando: !Cp — Imagen random (preservado sin cambios)
+# ══════════════════════════════════════════════════════════════════════════════
 
 @bot.command(name='Cp')
 async def imagen_random(ctx):
     await ctx.send("👀 Accediendo a la base de datos de **PABLO**... 👀")
-    
+
     # Tu array (lista) con los links ya definidos
     # Asegúrate de que los links terminen en .jpg, .png o .gif para que Discord los muestre bien
     lista_imagenes = [
@@ -146,25 +281,75 @@ async def imagen_random(ctx):
         "https://ei.phncdn.com/videos/201903/20/214077662/original/(m=qUQ2LZYbeaSaaTbaAaaaa)(mh=LPs0VCmi_NSnTkqo)0.jpg",
         "https://media.thisvid.com/contents/videos_screenshots/11607000/11607397/preview.jpg",
         "https://media.tenor.com/cYCZH_WGX6gAAAAe/vardoc1-cuck.png"
-        
     ]
-    
+
     try:
         # La magia de Python: elige un elemento al azar de la lista
         url_elegida = random.choice(lista_imagenes)
-        
+
         # Armamos el mensaje visual
         embed = discord.Embed(
-            title="🔥 Happy Chantussy", 
-            color=discord.Color.dark_red() 
+            title="🔥 Happy Chantussy",
+            color=discord.Color.dark_red()
         )
         embed.set_image(url=url_elegida)
-        
+
         # Enviamos la imagen al canal
         await ctx.send(embed=embed)
-        
+
     except Exception as e:
         await ctx.send(f"❌ Error al enviar la imagen: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Comando: !Pape — Muestra imagen de Pape
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.command(name='Pape')
+async def imagen_pape(ctx):
+    """Muestra la imagen de Pape desde GitHub."""
+    try:
+        # Cambia esta URL por la imagen real de Pape (enlace RAW de GitHub)
+        url_pape = "https://raw.githubusercontent.com/puntodev90-dev/images/refs/heads/main/WhatsApp%20Image%202026-06-08%20at%201.18.27%20AM.jpeg"
+
+        embed = discord.Embed(
+            title="🔥 Pape",
+            color=discord.Color.purple()
+        )
+        embed.set_image(url=url_pape)
+
+        await ctx.send(embed=embed)
+
+    except Exception as e:
+        await ctx.send(f"❌ Error al enviar la imagen: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Comando: !Ikkyi — Muestra imagen de Ikkyi
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.command(name='Ikkyi')
+async def imagen_ikkyi(ctx):
+    """Muestra la imagen de Ikkyi desde GitHub."""
+    try:
+        # Cambia esta URL por la imagen real de Ikkyi (enlace RAW de GitHub)
+        url_ikkyi = "https://raw.githubusercontent.com/puntodev90-dev/images/refs/heads/main/WhatsApp%20Image%202026-06-08%20at%201.18.28%20AM%20(1).jpeg"
+
+        embed = discord.Embed(
+            title="🔥 Ikkyi",
+            color=discord.Color.dark_red()
+        )
+        embed.set_image(url=url_ikkyi)
+
+        await ctx.send(embed=embed)
+
+    except Exception as e:
+        await ctx.send(f"❌ Error al enviar la imagen: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Arranque del bot
+# ══════════════════════════════════════════════════════════════════════════════
 
 # Mantener vivo el bot en Azure App Service (plan F1)
 keep_alive()

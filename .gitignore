@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pem
+*.key
+azure_key.pem
